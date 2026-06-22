@@ -113,50 +113,44 @@ jobs:
         id: analyze
         shell: pwsh
         run: |
-          # Run analyzer; capture stdout+stderr; do not let PowerShell swallow the exit code
+          # --resultPath writes structured JSON; --outputType does not exist in v25.10+
+          $reportPath = "analysis-report.json"
           $output = & uipcli.exe package analyze "${{ env.PROJECT_FILE }}" `
             --analyzerTraceLevel "Error" `
-            --outputType "json" 2>&1
+            --resultPath $reportPath 2>&1
           $exitCode = $LASTEXITCODE
 
-          # Persist raw output regardless of result
+          # Persist raw console output regardless of result
           $output | Out-File -FilePath "analysis-output.txt" -Encoding utf8
 
-          # Find the JSON report the analyzer may have written alongside project.json
-          $reportFile = Get-ChildItem -Path "." -Filter "*.json" -File |
-            Where-Object { $_.Name -ne "project.json" } |
-            Select-Object -First 1
-
-          if ($reportFile) {
-            Copy-Item $reportFile.FullName "analysis-report.json"
+          if (Test-Path $reportPath) {
             try {
-              $report    = Get-Content "analysis-report.json" -Raw | ConvertFrom-Json
-              $errors    = @($report | Where-Object { $_.MessageType -eq "Error" })
-              $warnings  = @($report | Where-Object { $_.MessageType -eq "Warning" })
-              $infos     = @($report | Where-Object { $_.MessageType -notin @("Error","Warning") })
+              $report   = @(Get-Content $reportPath -Raw | ConvertFrom-Json)
+              $errors   = @($report | Where-Object { $_.MessageType -eq "Error" })
+              $warnings = @($report | Where-Object { $_.MessageType -eq "Warning" })
+              $infos    = @($report | Where-Object { $_.MessageType -notin @("Error","Warning") })
 
-              # Step summary
               @"
           ## Workflow Analyzer Results
           | Severity | Count |
           |----------|-------|
-          | ❌ Errors | $($errors.Count) |
-          | ⚠️ Warnings | $($warnings.Count) |
-          | ℹ️ Info | $($infos.Count) |
+          | Errors | $($errors.Count) |
+          | Warnings | $($warnings.Count) |
+          | Info | $($infos.Count) |
           "@ | Add-Content -Path $env:GITHUB_STEP_SUMMARY
 
               if ($errors.Count -gt 0) {
                 "`n### Errors" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
                 foreach ($e in $errors) {
-                  "- **[$($e.RuleId)]** $($e.Description) — ``$($e.FilePath)``" |
+                  "- **[$($e.RuleId)]** $($e.Description) -- $($e.FilePath)" |
                     Add-Content -Path $env:GITHUB_STEP_SUMMARY
                 }
               }
             } catch {
-              Write-Warning "Could not parse analyzer JSON report: $_"
+              Write-Warning "Could not parse analysis-report.json: $_"
             }
           } else {
-            # Plain-text fallback summary
+            # No report file — surface raw CLI output in summary
             $fence = '```'
             $fence | Add-Content -Path $env:GITHUB_STEP_SUMMARY
             $output | Add-Content -Path $env:GITHUB_STEP_SUMMARY
