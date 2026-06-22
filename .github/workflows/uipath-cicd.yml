@@ -25,9 +25,9 @@ name: UiPath CI/CD
 
 on:
   push:
-    branches: [main, develop, "feature/**", "release/**"]
+    branches: [main, master, develop, "feature/**", "release/**"]
   pull_request:
-    branches: [main, develop]
+    branches: [main, master, develop]
   workflow_dispatch:
     inputs:
       force_deploy:
