@@ -129,7 +129,7 @@ $analyzerViolations = @()
 $analyzerReportPath = Join-Path $ArtifactsDir "analysis-report.json"
 if (Test-Path $analyzerReportPath) {
     try {
-        $analyzerViolations = Get-Content $analyzerReportPath -Raw | ConvertFrom-Json
+        $analyzerViolations = @(Get-Content $analyzerReportPath -Raw | ConvertFrom-Json)
         Write-Host "Loaded $($analyzerViolations.Count) analyzer finding(s)"
     } catch {
         $warnings.Add("Could not parse analysis-report.json: $_")
@@ -200,7 +200,7 @@ $null = $sb.AppendLine("| Package | $($statusEmoji[$PackageResult] ?? '❓') $Pa
 $null = $sb.AppendLine("")
 
 # Auto-fixed items
-$autoFixes = $fixes | Where-Object { $_.Auto -eq $true }
+$autoFixes = @($fixes | Where-Object { $_.Auto -eq $true })
 if ($autoFixes.Count -gt 0) {
     $null = $sb.AppendLine("### ✅ Auto-Applied Fixes (included in this PR)")
     $null = $sb.AppendLine("")
@@ -213,7 +213,7 @@ if ($autoFixes.Count -gt 0) {
 }
 
 # Manual fixes required
-$manualFixes = $fixes | Where-Object { $_.Auto -eq $false }
+$manualFixes = @($fixes | Where-Object { $_.Auto -eq $false })
 if ($manualFixes.Count -gt 0) {
     $null = $sb.AppendLine("### 🔧 Manual Fixes Required")
     $null = $sb.AppendLine("")
