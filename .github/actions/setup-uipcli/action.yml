@@ -1,0 +1,64 @@
+name: Setup UiPath CLI
+description: Downloads and caches the UiPath CLI (uipcli.exe) and adds it to PATH
+
+inputs:
+  version:
+    description: NuGet version of UiPath.CLI.Windows to install
+    required: true
+  cache-key-prefix:
+    description: Prefix for the cache key
+    required: false
+    default: uipcli
+
+runs:
+  using: composite
+  steps:
+    - name: Cache UiPath CLI
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ runner.tool_cache }}/uipcli/${{ inputs.version }}
+        key: ${{ inputs.cache-key-prefix }}-windows-${{ inputs.version }}
+
+    - name: Download UiPath CLI via NuGet
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: pwsh
+      run: |
+        $installDir = "$env:RUNNER_TOOL_CACHE\uipcli\${{ inputs.version }}"
+        New-Item -ItemType Directory -Path $installDir -Force | Out-Null
+
+        Write-Host "Downloading UiPath.CLI.Windows ${{ inputs.version }} from NuGet..."
+        nuget install UiPath.CLI.Windows `
+          -Version "${{ inputs.version }}" `
+          -OutputDirectory "$installDir\pkg" `
+          -NonInteractive `
+          -Source "https://api.nuget.org/v3/index.json"
+
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "nuget install failed (exit $LASTEXITCODE)"
+          exit 1
+        }
+
+        $cli = Get-ChildItem -Path "$installDir\pkg" -Recurse -Filter "uipcli.exe" | Select-Object -First 1
+        if (-not $cli) {
+          Write-Error "uipcli.exe not found after NuGet install. Check the package version."
+          exit 1
+        }
+
+        # Flatten: copy the entire tools directory to the cache root so PATH works
+        $toolsDir = $cli.DirectoryName
+        Copy-Item -Path "$toolsDir\*" -Destination $installDir -Recurse -Force
+        Write-Host "uipcli.exe installed to: $installDir"
+
+    - name: Add UiPath CLI to PATH
+      shell: pwsh
+      run: |
+        $binDir = "$env:RUNNER_TOOL_CACHE\uipcli\${{ inputs.version }}"
+        echo $binDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        Write-Host "Added to PATH: $binDir"
+
+    - name: Verify CLI
+      shell: pwsh
+      run: |
+        $ver = & uipcli.exe --version 2>&1
+        Write-Host "uipcli version: $ver"

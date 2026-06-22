@@ -1,0 +1,459 @@
+# UiPath CI/CD Pipeline — Coding Agent
+#
+# Stages:
+#   validate  → package  → [propose-fixes on failure]
+#                        ↓ (develop/main only)
+#                   deploy-staging
+#                        ↓ (main only)
+#                   await-approval   ← human gate (GitHub Environment "production-gate")
+#                        ↓
+#                   deploy-production
+#
+# Required Secrets (Settings → Secrets and variables → Actions):
+#   STAGING_ORCHESTRATOR_URL  STAGING_TENANT  STAGING_CLIENT_ID  STAGING_CLIENT_SECRET  STAGING_ORGANIZATION
+#   PROD_ORCHESTRATOR_URL     PROD_TENANT     PROD_CLIENT_ID     PROD_CLIENT_SECRET     PROD_ORGANIZATION
+#
+# Required Variables (Settings → Secrets and variables → Actions → Variables):
+#   STAGING_FOLDER            PROD_FOLDER
+#
+# Required Environments (Settings → Environments):
+#   staging           – no protection rules needed
+#   production-gate   – add required reviewers here (this is the human approval gate)
+#   production        – no additional protection rules needed
+
+name: UiPath CI/CD
+
+on:
+  push:
+    branches: [main, develop, "feature/**", "release/**"]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+    inputs:
+      force_deploy:
+        description: "Force deployment even from a non-main branch"
+        required: false
+        default: "false"
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Update this to match the Studio version in project.json (studioVersion field).
+  # Check https://www.nuget.org/packages/UiPath.CLI.Windows for available versions.
+  UIPATH_CLI_VERSION: "25.10.9196.32697"
+  PROJECT_FILE: "project.json"
+  OUTPUT_DIR: "./output"
+
+# ═══════════════════════════════════════════════════════════════════
+# JOB 1 — Validate & Analyze
+# ═══════════════════════════════════════════════════════════════════
+jobs:
+  validate:
+    name: Validate & Analyze
+    runs-on: windows-latest
+    outputs:
+      result: ${{ job.status }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup UiPath CLI
+        uses: ./.github/actions/setup-uipcli
+        with:
+          version: ${{ env.UIPATH_CLI_VERSION }}
+
+      - name: Validate project.json schema
+        id: schema
+        shell: pwsh
+        run: |
+          $proj = Get-Content "${{ env.PROJECT_FILE }}" -Raw | ConvertFrom-Json
+
+          # Required field check
+          $required = @('name','main','projectVersion','schemaVersion','targetFramework')
+          foreach ($f in $required) {
+            if (-not $proj.$f) {
+              Write-Error "project.json is missing required field: '$f'"
+              exit 1
+            }
+          }
+
+          # Target framework must be Windows for this project
+          if ($proj.targetFramework -ne 'Windows') {
+            Write-Error "Expected targetFramework 'Windows', got '$($proj.targetFramework)'"
+            exit 1
+          }
+
+          # Main entry point must exist on disk
+          if (-not (Test-Path $proj.main)) {
+            Write-Error "Main entry point '$($proj.main)' not found in workspace"
+            exit 1
+          }
+
+          Write-Host "Schema OK"
+          Write-Host "  Project  : $($proj.name) v$($proj.projectVersion)"
+          Write-Host "  Framework: $($proj.targetFramework)"
+          Write-Host "  Studio   : $($proj.studioVersion)"
+
+          # Surface key info to the job summary
+          @"
+          ## Project Info
+          | Field | Value |
+          |-------|-------|
+          | Name | $($proj.name) |
+          | Version | $($proj.projectVersion) |
+          | Studio | $($proj.studioVersion) |
+          | Framework | $($proj.targetFramework) |
+          | Main | $($proj.main) |
+          "@ | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+
+      - name: Run Workflow Analyzer
+        id: analyze
+        shell: pwsh
+        run: |
+          # Run analyzer; capture stdout+stderr; do not let PowerShell swallow the exit code
+          $output = & uipcli.exe package analyze "${{ env.PROJECT_FILE }}" `
+            --analyzerTraceLevel "Error" `
+            --outputType "json" 2>&1
+          $exitCode = $LASTEXITCODE
+
+          # Persist raw output regardless of result
+          $output | Out-File -FilePath "analysis-output.txt" -Encoding utf8
+
+          # Find the JSON report the analyzer may have written alongside project.json
+          $reportFile = Get-ChildItem -Path "." -Filter "*.json" -File |
+            Where-Object { $_.Name -ne "project.json" } |
+            Select-Object -First 1
+
+          if ($reportFile) {
+            Copy-Item $reportFile.FullName "analysis-report.json"
+            try {
+              $report    = Get-Content "analysis-report.json" -Raw | ConvertFrom-Json
+              $errors    = @($report | Where-Object { $_.MessageType -eq "Error" })
+              $warnings  = @($report | Where-Object { $_.MessageType -eq "Warning" })
+              $infos     = @($report | Where-Object { $_.MessageType -notin @("Error","Warning") })
+
+              # Step summary
+              @"
+          ## Workflow Analyzer Results
+          | Severity | Count |
+          |----------|-------|
+          | ❌ Errors | $($errors.Count) |
+          | ⚠️ Warnings | $($warnings.Count) |
+          | ℹ️ Info | $($infos.Count) |
+          "@ | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+
+              if ($errors.Count -gt 0) {
+                "`n### Errors" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+                foreach ($e in $errors) {
+                  "- **[$($e.RuleId)]** $($e.Description) — ``$($e.FilePath)``" |
+                    Add-Content -Path $env:GITHUB_STEP_SUMMARY
+                }
+              }
+            } catch {
+              Write-Warning "Could not parse analyzer JSON report: $_"
+            }
+          } else {
+            # Plain-text fallback summary
+            "```" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+            $output | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+            "```" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          }
+
+          if ($exitCode -ne 0) {
+            Write-Error "Workflow Analyzer found violations (exit $exitCode). See summary for details."
+            exit $exitCode
+          }
+          Write-Host "Workflow Analyzer passed with no errors"
+
+      - name: Upload analysis artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: analysis-results
+          path: |
+            analysis-output.txt
+            analysis-report.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+# ═══════════════════════════════════════════════════════════════════
+# JOB 2 — Package
+# ═══════════════════════════════════════════════════════════════════
+  package:
+    name: Package
+    needs: validate
+    runs-on: windows-latest
+    outputs:
+      package_name: ${{ steps.pack.outputs.package_name }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup UiPath CLI
+        uses: ./.github/actions/setup-uipcli
+        with:
+          version: ${{ env.UIPATH_CLI_VERSION }}
+
+      - name: Pack project
+        id: pack
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path "${{ env.OUTPUT_DIR }}" -Force | Out-Null
+
+          & uipcli.exe package pack "${{ env.PROJECT_FILE }}" `
+            --output "${{ env.OUTPUT_DIR }}" `
+            --outputType Process `
+            --autoVersion
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "uipcli pack failed (exit $LASTEXITCODE)"
+            exit $LASTEXITCODE
+          }
+
+          $pkg = Get-ChildItem -Path "${{ env.OUTPUT_DIR }}" -Filter "*.nupkg" | Select-Object -First 1
+          if (-not $pkg) {
+            Write-Error "No .nupkg produced after pack. Check CLI output above."
+            exit 1
+          }
+
+          $sizeMB = [math]::Round($pkg.Length / 1MB, 2)
+          echo "package_name=$($pkg.Name)" >> $env:GITHUB_OUTPUT
+          Write-Host "Package: $($pkg.Name)  ($sizeMB MB)"
+
+          @"
+          ## Package
+          | Field | Value |
+          |-------|-------|
+          | File | $($pkg.Name) |
+          | Size | $sizeMB MB |
+          | SHA256 | $(Get-FileHash $pkg.FullName -Algorithm SHA256 | Select-Object -ExpandProperty Hash) |
+          "@ | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: uipath-package
+          path: ${{ env.OUTPUT_DIR }}/*.nupkg
+          retention-days: 30
+
+# ═══════════════════════════════════════════════════════════════════
+# JOB 3 — Propose Fixes  (only fires when a prior job failed)
+# ═══════════════════════════════════════════════════════════════════
+  propose-fixes:
+    name: Propose Fixes
+    needs: [validate, package]
+    # Run only on failures, not on PRs (avoids creating PR from PR branch)
+    if: >-
+      always() &&
+      (needs.validate.result == 'failure' || needs.package.result == 'failure') &&
+      github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download analysis artifacts
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: analysis-results
+          path: ./ci-artifacts
+
+      - name: Generate fix proposals
+        id: generate
+        shell: pwsh
+        run: |
+          .github/scripts/propose-fixes.ps1 `
+            -ProjectFile          "${{ env.PROJECT_FILE }}" `
+            -ArtifactsDir         "./ci-artifacts" `
+            -ValidateResult       "${{ needs.validate.result }}" `
+            -PackageResult        "${{ needs.package.result }}" `
+            -OutputReport         "fix-proposals.md" `
+            -OutputProject        "project-fixed.json"
+
+      - name: Commit fixes and open PR
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH="auto-fix/run-${{ github.run_number }}-$(date +%Y%m%d%H%M%S)"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+
+          # Apply patched project.json if the script produced one
+          if [ -f "project-fixed.json" ]; then
+            cp project-fixed.json project.json
+            git add project.json
+          fi
+
+          # Archive the fix-proposal report inside the repo for traceability
+          mkdir -p docs/ci-reports
+          cp fix-proposals.md "docs/ci-reports/run-${{ github.run_number }}.md"
+          git add docs/ci-reports/
+
+          if git diff --cached --quiet; then
+            echo "Nothing to commit — no automated fixes applicable."
+            exit 0
+          fi
+
+          git commit -m "ci: auto-fix proposals for run #${{ github.run_number }}"
+          git push origin "$BRANCH"
+
+          BODY="$(cat fix-proposals.md)"
+          gh pr create \
+            --head "$BRANCH" \
+            --base "${{ github.ref_name }}" \
+            --title "🔧 CI Fix Proposals — Run #${{ github.run_number }}" \
+            --body "$BODY" \
+            --label "ci-fix,needs-review"
+
+# ═══════════════════════════════════════════════════════════════════
+# JOB 4 — Deploy to Staging
+# ═══════════════════════════════════════════════════════════════════
+  deploy-staging:
+    name: Deploy → Staging
+    needs: package
+    if: >-
+      success() &&
+      (github.ref == 'refs/heads/main' ||
+       github.ref == 'refs/heads/develop' ||
+       inputs.force_deploy == 'true')
+    environment:
+      name: staging
+      url: ${{ vars.STAGING_ORCHESTRATOR_URL }}
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup UiPath CLI
+        uses: ./.github/actions/setup-uipcli
+        with:
+          version: ${{ env.UIPATH_CLI_VERSION }}
+
+      - name: Download package
+        uses: actions/download-artifact@v4
+        with:
+          name: uipath-package
+          path: ./output
+
+      - name: Deploy to Staging Orchestrator
+        shell: pwsh
+        run: |
+          $pkg = Get-ChildItem -Path ./output -Filter "*.nupkg" | Select-Object -First 1
+          if (-not $pkg) { Write-Error "No package artifact found"; exit 1 }
+
+          Write-Host "Deploying $($pkg.Name) to Staging..."
+
+          & uipcli.exe package deploy "$($pkg.FullName)" `
+            "${{ secrets.STAGING_ORCHESTRATOR_URL }}" `
+            "${{ secrets.STAGING_TENANT }}" `
+            --clientID "${{ secrets.STAGING_CLIENT_ID }}" `
+            --userKey  "${{ secrets.STAGING_CLIENT_SECRET }}" `
+            -o "${{ secrets.STAGING_ORGANIZATION }}" `
+            -f "${{ vars.STAGING_FOLDER }}"
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Staging deployment failed (exit $LASTEXITCODE)"
+            exit $LASTEXITCODE
+          }
+          Write-Host "Deployed to Staging successfully"
+
+# ═══════════════════════════════════════════════════════════════════
+# JOB 5 — Human Approval Gate
+# ═══════════════════════════════════════════════════════════════════
+  await-approval:
+    name: "Await Approval"
+    needs: deploy-staging
+    # Only gate production deployments from main
+    if: github.ref == 'refs/heads/main'
+    # "production-gate" environment must have Required Reviewers configured
+    # in Settings → Environments → production-gate → Protection rules.
+    environment:
+      name: production-gate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Approval confirmed
+        run: |
+          echo "Production deployment approved by: ${{ github.actor }}"
+          echo "Workflow run: ${{ github.run_number }}"
+          echo "Package: ${{ needs.package.outputs.package_name }}"
+
+# ═══════════════════════════════════════════════════════════════════
+# JOB 6 — Deploy to Production
+# ═══════════════════════════════════════════════════════════════════
+  deploy-production:
+    name: Deploy → Production
+    needs: [package, await-approval]
+    environment:
+      name: production
+      url: ${{ vars.PROD_ORCHESTRATOR_URL }}
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup UiPath CLI
+        uses: ./.github/actions/setup-uipcli
+        with:
+          version: ${{ env.UIPATH_CLI_VERSION }}
+
+      - name: Download package
+        uses: actions/download-artifact@v4
+        with:
+          name: uipath-package
+          path: ./output
+
+      - name: Deploy to Production Orchestrator
+        id: deploy
+        shell: pwsh
+        run: |
+          $pkg = Get-ChildItem -Path ./output -Filter "*.nupkg" | Select-Object -First 1
+          if (-not $pkg) { Write-Error "No package artifact found"; exit 1 }
+
+          Write-Host "Deploying $($pkg.Name) to Production..."
+
+          & uipcli.exe package deploy "$($pkg.FullName)" `
+            "${{ secrets.PROD_ORCHESTRATOR_URL }}" `
+            "${{ secrets.PROD_TENANT }}" `
+            --clientID "${{ secrets.PROD_CLIENT_ID }}" `
+            --userKey  "${{ secrets.PROD_CLIENT_SECRET }}" `
+            -o "${{ secrets.PROD_ORGANIZATION }}" `
+            -f "${{ vars.PROD_FOLDER }}"
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Production deployment failed (exit $LASTEXITCODE)"
+            exit $LASTEXITCODE
+          }
+          Write-Host "Deployed to Production successfully"
+          echo "deployed_at=$(Get-Date -Format 'yyyy-MM-ddTHH:mm:ssZ')" >> $env:GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PACKAGE="${{ needs.package.outputs.package_name }}"
+          TAG="release-${{ github.run_number }}"
+          gh release create "$TAG" ./output/*.nupkg \
+            --title "Release #${{ github.run_number }}" \
+            --notes "**Package:** \`$PACKAGE\`
+          **Deployed to Production:** ${{ steps.deploy.outputs.deployed_at }}
+          **Approved by:** ${{ github.actor }}
+          **Workflow run:** [${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"

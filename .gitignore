@@ -1,0 +1,16 @@
+# UiPath local IDE state — machine-specific, not source
+.settings/
+.tmh/
+.objects/
+.local/
+
+# Build output
+output/
+*.nupkg
+
+# CI report artifacts (generated at runtime)
+docs/ci-reports/
+
+# Windows
+Thumbs.db
+desktop.ini
