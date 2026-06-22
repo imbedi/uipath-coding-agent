@@ -157,9 +157,10 @@ jobs:
             }
           } else {
             # Plain-text fallback summary
-            "```" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+            $fence = '```'
+            $fence | Add-Content -Path $env:GITHUB_STEP_SUMMARY
             $output | Add-Content -Path $env:GITHUB_STEP_SUMMARY
-            "```" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+            $fence | Add-Content -Path $env:GITHUB_STEP_SUMMARY
           }
 
           if ($exitCode -ne 0) {
