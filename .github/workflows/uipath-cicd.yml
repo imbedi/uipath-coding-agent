@@ -41,9 +41,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Update this to match the Studio version in project.json (studioVersion field).
   # Check https://www.nuget.org/packages/UiPath.CLI.Windows for available versions.
-  UIPATH_CLI_VERSION: "25.10.9196.32697"
+  UIPATH_CLI_VERSION: "25.10.20"
   PROJECT_FILE: "project.json"
   OUTPUT_DIR: "./output"
 

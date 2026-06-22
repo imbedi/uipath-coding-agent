@@ -1,9 +1,9 @@
 name: Setup UiPath CLI
-description: Downloads and caches the UiPath CLI (uipcli.exe) and adds it to PATH
+description: Downloads and caches UiPath.CLI.Windows from NuGet and adds uipcli.exe to PATH
 
 inputs:
   version:
-    description: NuGet version of UiPath.CLI.Windows to install
+    description: NuGet version of UiPath.CLI.Windows (e.g. 25.10.20)
     required: true
   cache-key-prefix:
     description: Prefix for the cache key
@@ -24,13 +24,13 @@ runs:
       if: steps.cache.outputs.cache-hit != 'true'
       shell: pwsh
       run: |
-        $installDir = "$env:RUNNER_TOOL_CACHE\uipcli\${{ inputs.version }}"
-        New-Item -ItemType Directory -Path $installDir -Force | Out-Null
+        $pkgRoot = "$env:RUNNER_TOOL_CACHE\uipcli\${{ inputs.version }}"
+        New-Item -ItemType Directory -Path $pkgRoot -Force | Out-Null
 
         Write-Host "Downloading UiPath.CLI.Windows ${{ inputs.version }} from NuGet..."
         nuget install UiPath.CLI.Windows `
           -Version "${{ inputs.version }}" `
-          -OutputDirectory "$installDir\pkg" `
+          -OutputDirectory "$pkgRoot" `
           -NonInteractive `
           -Source "https://api.nuget.org/v3/index.json"
 
@@ -39,26 +39,45 @@ runs:
           exit 1
         }
 
-        $cli = Get-ChildItem -Path "$installDir\pkg" -Recurse -Filter "uipcli.exe" | Select-Object -First 1
+        # Locate uipcli.exe inside the extracted package tree
+        $cli = Get-ChildItem -Path $pkgRoot -Recurse -Filter "uipcli.exe" | Select-Object -First 1
         if (-not $cli) {
-          Write-Error "uipcli.exe not found after NuGet install. Check the package version."
+          Write-Error "uipcli.exe not found in extracted package. Available files:"
+          Get-ChildItem $pkgRoot -Recurse | Select-Object -ExpandProperty FullName
           exit 1
         }
 
-        # Flatten: copy the entire tools directory to the cache root so PATH works
-        $toolsDir = $cli.DirectoryName
-        Copy-Item -Path "$toolsDir\*" -Destination $installDir -Recurse -Force
-        Write-Host "uipcli.exe installed to: $installDir"
+        # Persist the bin directory path so the PATH step can read it from cache
+        $cli.DirectoryName | Out-File -FilePath "$pkgRoot\.binpath" -Encoding utf8
+        Write-Host "uipcli.exe found at: $($cli.FullName)"
 
     - name: Add UiPath CLI to PATH
       shell: pwsh
       run: |
-        $binDir = "$env:RUNNER_TOOL_CACHE\uipcli\${{ inputs.version }}"
-        echo $binDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        $pkgRoot  = "$env:RUNNER_TOOL_CACHE\uipcli\${{ inputs.version }}"
+        $binPath  = "$pkgRoot\.binpath"
+
+        if (Test-Path $binPath) {
+          $binDir = (Get-Content $binPath -Raw).Trim()
+        } else {
+          # Fallback: search again (handles cache-hit path where .binpath already exists)
+          $cli    = Get-ChildItem -Path $pkgRoot -Recurse -Filter "uipcli.exe" | Select-Object -First 1
+          if (-not $cli) {
+            Write-Error "Cannot locate uipcli.exe in $pkgRoot"
+            exit 1
+          }
+          $binDir = $cli.DirectoryName
+        }
+
+        $binDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
         Write-Host "Added to PATH: $binDir"
 
     - name: Verify CLI
       shell: pwsh
       run: |
         $ver = & uipcli.exe --version 2>&1
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "uipcli.exe not usable (exit $LASTEXITCODE): $ver"
+          exit 1
+        }
         Write-Host "uipcli version: $ver"
